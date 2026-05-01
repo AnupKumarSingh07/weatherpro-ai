@@ -16,12 +16,112 @@ const favoriteBtn = $("favorite-btn");
 const scene = $("weather-scene");
 
 let activeCity = "Kolkata";
+let activeLocationLabel = "";
+let activeLocationMeta = null;
+
 let tempChart = null;
 let humidityChart = null;
 let debounceTimer = null;
 
-function normalizeCity(city) {
-  return city.trim().toLowerCase();
+function normalizeText(value = "") {
+  return String(value).trim().toLowerCase();
+}
+
+function getCityKey(item) {
+  if (!item) return "";
+
+  if (typeof item === "string") {
+    return normalizeText(item);
+  }
+
+  if (item.lat && item.lon) {
+    return `${Number(item.lat).toFixed(4)},${Number(item.lon).toFixed(4)}`;
+  }
+
+  return normalizeText(`${item.city || ""},${item.label || ""}`);
+}
+
+function escapeHTML(value = "") {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function toCityObject(value) {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    const parts = value.split(",").map((item) => item.trim()).filter(Boolean);
+
+    return {
+      city: parts[0] || value,
+      label: parts.slice(1).join(", "),
+      lat: null,
+      lon: null
+    };
+  }
+
+  return {
+    city: value.city || value.name || "",
+    label: value.label || "",
+    lat: value.lat ?? null,
+    lon: value.lon ?? null
+  };
+}
+
+function getCountryName(countryCode) {
+  try {
+    const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+    return regionNames.of(countryCode) || countryCode;
+  } catch {
+    return countryCode;
+  }
+}
+
+function buildLocationLabel(geo) {
+  const countryName = getCountryName(geo.country);
+  return geo.state ? `${geo.state}, ${countryName}` : countryName;
+}
+
+function scoreGeoResult(item, query) {
+  const fullQuery = normalizeText(query);
+  const primaryQuery = normalizeText(query.split(",")[0]);
+
+  const itemName = normalizeText(item.name);
+  const itemState = normalizeText(item.state || "");
+  const itemCountryCode = normalizeText(item.country || "");
+  const itemCountryName = normalizeText(getCountryName(item.country || ""));
+
+  let score = 0;
+
+  if (itemName === fullQuery) score += 120;
+  if (itemName === primaryQuery) score += 100;
+  if (itemName.startsWith(primaryQuery)) score += 50;
+  if (itemName.includes(primaryQuery)) score += 25;
+
+  if (item.local_names) {
+    const localNames = Object.values(item.local_names).map(normalizeText);
+
+    if (localNames.includes(fullQuery)) score += 110;
+    if (localNames.includes(primaryQuery)) score += 90;
+  }
+
+  if (itemState && fullQuery.includes(itemState)) score += 40;
+  if (itemCountryName && fullQuery.includes(itemCountryName)) score += 40;
+  if (itemCountryCode && fullQuery.includes(itemCountryCode)) score += 30;
+
+  if (item.state) score += 5;
+
+  return score;
+}
+
+function pickBestGeoResult(geoData, query) {
+  return [...geoData].sort(
+    (a, b) => scoreGeoResult(b, query) - scoreGeoResult(a, query)
+  )[0];
 }
 
 function formatTime(unixTime, timezoneOffset, withAmPm = true) {
@@ -38,12 +138,45 @@ function formatTime(unixTime, timezoneOffset, withAmPm = true) {
 function formatDate(unixTime, timezoneOffset) {
   const date = new Date((unixTime + timezoneOffset) * 1000);
 
-  return date.toLocaleDateString("en-US", {
-    weekday: "long",
-    day: "numeric",
-    month: "long",
+  const weekday = date.toLocaleDateString("en-US", {
+    weekday: "short",
     timeZone: "UTC"
   });
+
+  const day = date.toLocaleDateString("en-US", {
+    day: "2-digit",
+    timeZone: "UTC"
+  });
+
+  const month = date.toLocaleDateString("en-US", {
+    month: "short",
+    timeZone: "UTC"
+  });
+
+  return `${weekday} • ${day} ${month}`;
+}
+
+function formatTimeParts(unixTime, timezoneOffset) {
+  const date = new Date((unixTime + timezoneOffset) * 1000);
+
+  let hours = date.getUTCHours();
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const ampm = hours >= 12 ? "PM" : "AM";
+
+  hours = hours % 12 || 12;
+
+  return {
+    time: `${hours}:${minutes}`,
+    ampm
+  };
+}
+
+function getLocationLabel(data) {
+  if (activeLocationLabel) {
+    return activeLocationLabel;
+  }
+
+  return getCountryName(data.sys.country);
 }
 
 function showLoader(show) {
@@ -183,8 +316,6 @@ async function getWeatherData(city) {
     return;
   }
 
-  activeCity = cleanCity;
-
   if (suggestionsBox) {
     suggestionsBox.style.display = "none";
   }
@@ -193,59 +324,20 @@ async function getWeatherData(city) {
   showLoader(true);
 
   try {
-    const cacheKey = `weather-v8-${cleanCity.toLowerCase()}`;
-    let bundle = getCache(cacheKey);
+    const geoData = await fetchJSON(
+      `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(cleanCity)}&limit=8&appid=${API_KEY}`
+    );
 
-    if (!bundle) {
-      const currentData = await fetchJSON(
-        `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(cleanCity)}&units=metric&appid=${API_KEY}`
-      );
-
-      const { lat, lon } = currentData.coord;
-
-      const [forecastData, aqiData, dailyData] = await Promise.all([
-        fetchJSON(
-          `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&appid=${API_KEY}`
-        ),
-        fetchJSON(
-          `https://api.openweathermap.org/data/2.5/air_pollution?lat=${lat}&lon=${lon}&appid=${API_KEY}`
-        ),
-        fetchJSON(
-          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
-        )
-      ]);
-
-      bundle = {
-        currentData,
-        forecastData,
-        aqiData,
-        dailyData
-      };
-
-      setCache(cacheKey, bundle);
+    if (!geoData || geoData.length === 0) {
+      throw new Error("city not found");
     }
 
-    const { currentData, forecastData, aqiData, dailyData } = bundle;
+    const geo = pickBestGeoResult(geoData, cleanCity);
+    const lat = geo.lat;
+    const lon = geo.lon;
+    const locationLabel = buildLocationLabel(geo);
 
-    activeCity = currentData.name;
-
-    updateCurrentWeatherUI(currentData);
-    updateAQIUI(aqiData.list[0]);
-    updateForecastUI(forecastData.list, currentData.timezone, dailyData);
-    updateCharts(forecastData.list, currentData.timezone);
-    updateAIAdvice(currentData, forecastData.list, aqiData.list[0]);
-    updateScene(currentData.weather[0].main, currentData.weather[0].icon);
-    saveRecentCity(currentData.name);
-    animateSunPosition(currentData.sys.sunrise, currentData.sys.sunset, currentData.timezone);
-    updateFavoriteButton();
-
-    dashboard.classList.remove("animate-in");
-    void dashboard.offsetWidth;
-    dashboard.classList.add("animate-in");
-
-    dashboard.style.display = "grid";
-
-    displayRecentCities();
+    await getWeatherByCoords(geo.name, lat, lon, locationLabel);
   } catch (error) {
     console.error("Weather Error:", error.message);
 
@@ -264,6 +356,95 @@ async function getWeatherData(city) {
     } else {
       showError("Weather data load nahi ho raha. Internet/API key check karo.");
     }
+
+    showLoader(false);
+  }
+}
+
+async function getWeatherByCoords(cityName, lat, lon, locationLabel = "") {
+  if (!cityName || !lat || !lon) return;
+
+  activeCity = cityName;
+  activeLocationLabel = locationLabel || "";
+  activeLocationMeta = {
+    city: cityName,
+    label: activeLocationLabel,
+    lat,
+    lon
+  };
+
+  if (suggestionsBox) {
+    suggestionsBox.style.display = "none";
+  }
+
+  hideError();
+  showLoader(true);
+
+  try {
+    const cacheKey = `weather-v12-coords-${Number(lat).toFixed(4)}-${Number(lon).toFixed(4)}`;
+    let bundle = getCache(cacheKey);
+
+    if (!bundle) {
+      const currentData = await fetchJSON(
+        `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&appid=${API_KEY}`
+      );
+
+      currentData.name = cityName;
+
+      const [forecastData, aqiData, dailyData] = await Promise.all([
+        fetchJSON(
+          `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&appid=${API_KEY}`
+        ),
+        fetchJSON(
+          `https://api.openweathermap.org/data/2.5/air_pollution?lat=${lat}&lon=${lon}&appid=${API_KEY}`
+        ),
+        fetchJSON(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
+        )
+      ]);
+
+      bundle = {
+        currentData,
+        forecastData,
+        aqiData,
+        dailyData,
+        locationLabel: activeLocationLabel,
+        locationMeta: activeLocationMeta
+      };
+
+      setCache(cacheKey, bundle);
+    }
+
+    const { currentData, forecastData, aqiData, dailyData, locationLabel, locationMeta } = bundle;
+
+    activeLocationLabel = locationLabel || "";
+    activeLocationMeta = locationMeta || activeLocationMeta;
+    activeCity = currentData.name;
+
+    updateCurrentWeatherUI(currentData);
+    updateAQIUI(aqiData.list[0]);
+    updateForecastUI(forecastData.list, currentData.timezone, dailyData);
+    updateCharts(forecastData.list, currentData.timezone);
+    updateAIAdvice(currentData, forecastData.list, aqiData.list[0]);
+    updateScene(currentData.weather[0].main, currentData.weather[0].icon);
+    saveRecentCity(activeLocationMeta);
+    animateSunPosition(currentData.sys.sunrise, currentData.sys.sunset, currentData.timezone);
+    updateFavoriteButton();
+
+    dashboard.classList.remove("animate-in");
+    void dashboard.offsetWidth;
+    dashboard.classList.add("animate-in");
+    dashboard.style.display = "grid";
+
+    displayRecentCities();
+  } catch (error) {
+    console.error("Weather Coords Error:", error.message);
+
+    if (dashboard) {
+      dashboard.style.display = "none";
+    }
+
+    showError("Weather data load nahi ho raha. Internet/API key check karo.");
   } finally {
     showLoader(false);
   }
@@ -273,10 +454,23 @@ function updateCurrentWeatherUI(data) {
   const timezone = data.timezone;
 
   $("city-name").innerText = data.name;
-  $("country-name").innerText = data.sys.country;
-  $("current-time").innerText = formatTime(Math.floor(Date.now() / 1000), timezone, false);
-  $("current-date").innerText = formatDate(Math.floor(Date.now() / 1000), timezone);
-  $("last-updated").innerText = `Updated ${formatTime(Math.floor(Date.now() / 1000), timezone)}`;
+
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const timeParts = formatTimeParts(nowUnix, timezone);
+
+  $("country-name").innerText = getLocationLabel(data);
+
+  $("current-time").innerHTML = `
+    ${timeParts.time}
+    <span class="time-ampm">${timeParts.ampm}</span>
+  `;
+
+  $("current-date").innerText = formatDate(nowUnix, timezone);
+
+  if ($("last-updated")) {
+    $("last-updated").style.display = "none";
+  }
+
   $("main-temp").innerText = `${Math.round(data.main.temp)}°C`;
   $("feels-like").innerText = `${Math.round(data.main.feels_like)}°C`;
 
@@ -619,26 +813,31 @@ function animateSunPosition(sunrise, sunset, timezone) {
 /* Recent + Favorite Logic */
 
 function getRecentCities() {
-  return JSON.parse(localStorage.getItem("recentCitiesV8")) || [];
+  const data = JSON.parse(localStorage.getItem("recentCitiesV12")) || [];
+  return data.map(toCityObject).filter((item) => item && item.city);
 }
 
 function setRecentCities(cities) {
-  localStorage.setItem("recentCitiesV8", JSON.stringify(cities));
+  localStorage.setItem("recentCitiesV12", JSON.stringify(cities));
 }
 
 function getFavorites() {
-  return JSON.parse(localStorage.getItem("favoriteCitiesV8")) || [];
+  const data = JSON.parse(localStorage.getItem("favoriteCitiesV12")) || [];
+  return data.map(toCityObject).filter((item) => item && item.city);
 }
 
 function setFavorites(cities) {
-  localStorage.setItem("favoriteCitiesV8", JSON.stringify(cities));
+  localStorage.setItem("favoriteCitiesV12", JSON.stringify(cities));
 }
 
 function uniqueCities(cities) {
   const seen = new Set();
 
   return cities.filter((city) => {
-    const key = normalizeCity(city);
+    const obj = toCityObject(city);
+    if (!obj) return false;
+
+    const key = getCityKey(obj);
 
     if (seen.has(key)) return false;
 
@@ -649,35 +848,34 @@ function uniqueCities(cities) {
 
 function getFinalCityChips() {
   const favorites = uniqueCities(getFavorites()).slice(0, 5);
-  const favoriteKeys = favorites.map(normalizeCity);
+  const favoriteKeys = favorites.map(getCityKey);
 
   const recent = uniqueCities(getRecentCities()).filter(
-    (city) => !favoriteKeys.includes(normalizeCity(city))
+    (city) => !favoriteKeys.includes(getCityKey(city))
   );
 
   return uniqueCities([...favorites, ...recent]).slice(0, 5);
 }
 
-function saveRecentCity(city) {
-  const cleanCity = city.trim();
-
-  if (!cleanCity) return;
+function saveRecentCity(cityData) {
+  const cityObj = toCityObject(cityData);
+  if (!cityObj || !cityObj.city) return;
 
   const favorites = uniqueCities(getFavorites()).slice(0, 5);
-  const favoriteKeys = favorites.map(normalizeCity);
+  const favoriteKeys = favorites.map(getCityKey);
 
   let recent = uniqueCities(getRecentCities());
 
   recent = recent.filter(
-    (item) => normalizeCity(item) !== normalizeCity(cleanCity)
+    (item) => getCityKey(item) !== getCityKey(cityObj)
   );
 
-  if (!favoriteKeys.includes(normalizeCity(cleanCity))) {
-    recent.unshift(cleanCity);
+  if (!favoriteKeys.includes(getCityKey(cityObj))) {
+    recent.unshift(cityObj);
   }
 
   const normalRecent = uniqueCities(recent).filter(
-    (item) => !favoriteKeys.includes(normalizeCity(item))
+    (item) => !favoriteKeys.includes(getCityKey(item))
   );
 
   const finalRecent = uniqueCities([
@@ -691,18 +889,29 @@ function saveRecentCity(city) {
 function displayRecentCities() {
   const finalCities = getFinalCityChips();
   const favorites = uniqueCities(getFavorites()).slice(0, 5);
-  const favoriteKeys = favorites.map(normalizeCity);
+  const favoriteKeys = favorites.map(getCityKey);
 
   setRecentCities(finalCities);
 
   recentCitiesContainer.innerHTML = finalCities
-    .map((city) => {
-      const isFav = favoriteKeys.includes(normalizeCity(city));
+    .map((item) => {
+      const city = toCityObject(item);
+      const isFav = favoriteKeys.includes(getCityKey(city));
+
+      const latAttr = city.lat ? `data-lat="${escapeHTML(city.lat)}"` : "";
+      const lonAttr = city.lon ? `data-lon="${escapeHTML(city.lon)}"` : "";
+      const labelAttr = city.label ? `data-label="${escapeHTML(city.label)}"` : "";
 
       return `
-        <span class="city-chip ${isFav ? "recent-fav-chip" : ""}" data-city="${city}">
+        <span 
+          class="city-chip ${isFav ? "recent-fav-chip" : ""}"
+          data-city="${escapeHTML(city.city)}"
+          ${latAttr}
+          ${lonAttr}
+          ${labelAttr}
+        >
           ${isFav ? `<i class="fa-solid fa-star"></i>` : ""}
-          ${city}
+          ${escapeHTML(city.city)}
         </span>
       `;
     })
@@ -710,8 +919,13 @@ function displayRecentCities() {
 }
 
 function updateFavoriteButton() {
+  const currentObj = activeLocationMeta || {
+    city: activeCity,
+    label: activeLocationLabel
+  };
+
   const isFavorite = getFavorites().some(
-    (city) => normalizeCity(city) === normalizeCity(activeCity)
+    (city) => getCityKey(city) === getCityKey(currentObj)
   );
 
   favoriteBtn.classList.toggle("active", isFavorite);
@@ -722,22 +936,27 @@ function updateFavoriteButton() {
 }
 
 favoriteBtn.addEventListener("click", () => {
+  const currentObj = activeLocationMeta || {
+    city: activeCity,
+    label: activeLocationLabel
+  };
+
   let favorites = uniqueCities(getFavorites());
 
   const exists = favorites.some(
-    (city) => normalizeCity(city) === normalizeCity(activeCity)
+    (city) => getCityKey(city) === getCityKey(currentObj)
   );
 
   if (exists) {
     favorites = favorites.filter(
-      (city) => normalizeCity(city) !== normalizeCity(activeCity)
+      (city) => getCityKey(city) !== getCityKey(currentObj)
     );
   } else {
-    favorites = uniqueCities([activeCity, ...favorites]).slice(0, 5);
+    favorites = uniqueCities([currentObj, ...favorites]).slice(0, 5);
   }
 
   setFavorites(favorites);
-  saveRecentCity(activeCity);
+  saveRecentCity(currentObj);
   updateFavoriteButton();
   displayRecentCities();
 });
@@ -750,19 +969,24 @@ async function showCitySuggestions(query) {
 
   try {
     const data = await fetchJSON(
-      `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(query)}&limit=5&appid=${API_KEY}`
+      `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(query)}&limit=8&appid=${API_KEY}`
     );
 
     suggestionsBox.innerHTML = data
       .map((item) => {
-        const city = item.name;
-        const state = item.state || "";
-        const country = item.country || "";
+        const countryName = getCountryName(item.country);
+        const label = buildLocationLabel(item);
 
         return `
-          <div class="suggestion-item" data-city="${city}">
-            <strong>${city}</strong>
-            <small>${state} ${country}</small>
+          <div 
+            class="suggestion-item"
+            data-city="${escapeHTML(item.name)}"
+            data-lat="${escapeHTML(item.lat)}"
+            data-lon="${escapeHTML(item.lon)}"
+            data-label="${escapeHTML(label)}"
+          >
+            <strong>${escapeHTML(item.name)}</strong>
+            <small>${escapeHTML(item.state ? item.state + ", " : "")}${escapeHTML(countryName)}</small>
           </div>
         `;
       })
@@ -793,7 +1017,17 @@ document.addEventListener("click", (event) => {
 
   if (target) {
     searchInput.value = target.dataset.city;
-    getWeatherData(target.dataset.city);
+
+    if (target.dataset.lat && target.dataset.lon) {
+      getWeatherByCoords(
+        target.dataset.city,
+        Number(target.dataset.lat),
+        Number(target.dataset.lon),
+        target.dataset.label || ""
+      );
+    } else {
+      getWeatherData(target.dataset.city);
+    }
   }
 
   if (!event.target.closest(".search-wrap")) {
@@ -812,12 +1046,27 @@ locationBtn.addEventListener("click", () => {
   navigator.geolocation.getCurrentPosition(
     async (position) => {
       try {
-        const data = await fetchJSON(
-          `https://api.openweathermap.org/data/2.5/weather?lat=${position.coords.latitude}&lon=${position.coords.longitude}&units=metric&appid=${API_KEY}`
+        const lat = position.coords.latitude;
+        const lon = position.coords.longitude;
+
+        const reverseGeo = await fetchJSON(
+          `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lon}&limit=1&appid=${API_KEY}`
         );
 
-        searchInput.value = data.name;
-        getWeatherData(data.name);
+        const place = reverseGeo && reverseGeo[0];
+
+        if (place) {
+          const label = buildLocationLabel(place);
+          searchInput.value = place.name;
+          getWeatherByCoords(place.name, place.lat, place.lon, label);
+        } else {
+          const data = await fetchJSON(
+            `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&appid=${API_KEY}`
+          );
+
+          searchInput.value = data.name;
+          getWeatherByCoords(data.name, lat, lon, getCountryName(data.sys.country));
+        }
       } catch (error) {
         console.error("Location Weather Error:", error.message);
         showLoader(false);
@@ -836,14 +1085,23 @@ $("theme-toggle").addEventListener("click", () => {
 
   const isDark = document.body.classList.contains("dark-mode");
 
-  localStorage.setItem("weatherThemeV8", isDark ? "dark" : "light");
+  localStorage.setItem("weatherThemeV12", isDark ? "dark" : "light");
 
   $("theme-toggle").querySelector("i").className = isDark
     ? "fa-solid fa-sun"
     : "fa-solid fa-moon";
 
   if (dashboard.style.display !== "none") {
-    getWeatherData(activeCity);
+    if (activeLocationMeta && activeLocationMeta.lat && activeLocationMeta.lon) {
+      getWeatherByCoords(
+        activeLocationMeta.city,
+        activeLocationMeta.lat,
+        activeLocationMeta.lon,
+        activeLocationMeta.label
+      );
+    } else {
+      getWeatherData(activeCity);
+    }
   }
 });
 
@@ -883,7 +1141,7 @@ function setupVoiceSearch() {
 }
 
 function initTheme() {
-  if (localStorage.getItem("weatherThemeV8") === "dark") {
+  if (localStorage.getItem("weatherThemeV12") === "dark") {
     document.body.classList.add("dark-mode");
     $("theme-toggle").querySelector("i").className = "fa-solid fa-sun";
   }
@@ -895,7 +1153,7 @@ function init() {
   setupVoiceSearch();
 
   setTimeout(() => {
-    getWeatherData("Kolkata");
+    getWeatherData("Kolkata, West Bengal, India");
   }, 300);
 }
 
