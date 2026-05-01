@@ -41,7 +41,7 @@ function formatDate(unixTime, timezoneOffset) {
   return date.toLocaleDateString("en-US", {
     weekday: "long",
     day: "numeric",
-    month: "short",
+    month: "long",
     timeZone: "UTC"
   });
 }
@@ -274,10 +274,9 @@ function updateCurrentWeatherUI(data) {
 
   $("city-name").innerText = data.name;
   $("country-name").innerText = data.sys.country;
-  $("current-time").innerText = formatTime(data.dt, timezone, false);
-  $("current-date").innerText = formatDate(data.dt, timezone);
-  $("last-updated").innerText = `Updated ${formatTime(data.dt, timezone)}`;
-
+  $("current-time").innerText = formatTime(Math.floor(Date.now() / 1000), timezone, false);
+  $("current-date").innerText = formatDate(Math.floor(Date.now() / 1000), timezone);
+  $("last-updated").innerText = `Updated ${formatTime(Math.floor(Date.now() / 1000), timezone)}`;
   $("main-temp").innerText = `${Math.round(data.main.temp)}°C`;
   $("feels-like").innerText = `${Math.round(data.main.feels_like)}°C`;
 
