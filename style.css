@@ -665,7 +665,7 @@ body {
   max-height: none;
 }
 
-.forecast-list{
+.forecast-list {
   display:flex;
   flex-direction:column;
   gap:14px;
@@ -674,17 +674,17 @@ body {
   margin-top:14px;
 }
 
-.forecast-item{
-  display:grid;
-  grid-template-columns:44px 1fr auto;
-  align-items:center;
-  column-gap:16px;
-  padding:8px 4px;
+.forecast-item {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  align-items: center;
+  column-gap: 16px;
+  padding: 8px 4px;
   border-bottom:var(--card-border);
 }
 
 .forecast-item:last-child {
-  border-bottom: 0;
+  border-bottom: none;
 }
 
 .forecast-item i,
